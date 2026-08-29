@@ -1,0 +1,16 @@
+# Secrets — must never enter the image. Glob, not just .env, in case a
+# .env.local/.env.production etc. ever shows up.
+.env*
+
+# Local dev venv — huge, platform-specific, and irrelevant: the image builds
+# its own venv from requirements.txt.
+venv/
+
+__pycache__/
+*.pyc
+
+.git/
+.gitignore
+README.md
+Dockerfile
+.dockerignore
