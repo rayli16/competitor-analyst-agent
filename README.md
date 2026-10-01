@@ -91,15 +91,15 @@ app/
 
 Each layer knows the one below it, never the one above — swapping `/analyze`'s engine from a single call to the full ReAct loop touched one line of `main.py`.
 
-## Known limitations
+## What I'd improve next
 
-Recorded honestly, because they're real and I'd rather name them than have them found:
+The service works fine right now, and here is my plan on areas that I'd refine next:
 
-- **`export_orientation` conflates two opposite things.** A China-based domestic-only manufacturer (could become a competitor) and an overseas import distributor (never will) can score the same, with opposite competitive meaning. It's the clearest design flaw, and it's where the model's and the rule's recommendations disagree most.
-- **~30% of a deep-dive's cost is duplicated work** — the last loop turn already writes a full analysis, then synthesis regenerates it as structured output. One prompt change from being fixed.
-- **No retries or model fallback** on the LLM API itself — an API-level failure still 500s. (Tool failures *inside* the loop are handled: they come back to the model as `is_error` so it can adapt, rather than crashing the run.)
-- **No memory** — every run starts cold; last week's research is redone.
-- **No test suite yet.** The pure functions (URL derivation, recommendation math, coverage checks) are easy to test and currently aren't.
+- **Make `export_orientation` more precise.** It currently scores evidence of serving overseas markets. Splitting it into two signals, whether the company makes the product and whether it already exports, would separate potential competitors from overseas resellers more cleanly. This is also where the model's recommendation and the rule's recommendation differ most often, so it's the most useful place to refine.
+- **Trim the final step of the deep-dive.** When the research loop finishes, the model's last turn often writes a plain-text summary before the structured report is generated. Adjusting the research prompt so the loop simply signals it's done would lower the cost per run.
+- **Add retries and a fallback model.** Search failures inside the loop are already handled: the error goes back to the model as `is_error`, so it can try another query. Adding the same resilience at the LLM API level (retrying on timeouts, or switching to a backup model) would make long runs more reliable.
+- **Add memory between runs.** Saving past results would let a repeat analysis reuse earlier research and highlight what changed since last time, which fits a weekly monitoring use case.
+- **Add tests.** The pure functions (URL handling, the recommendation rule, the coverage checks) are straightforward to cover with unit tests.
 
 ## Stack
 
