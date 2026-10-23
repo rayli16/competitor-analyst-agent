@@ -5,3 +5,10 @@ __pycache__/
 .DS_Store
 __pycache__/
 venv/
+
+# Eval outputs — local artifacts, summarize them in the PR instead
+evals/results/
+.pytest_cache/
+# Real eval golden set — our competitor list and target markets are internal
+# business data. Only the fictional evals/golden_set.example.json is committed.
+evals/golden_set.json

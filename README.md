@@ -60,7 +60,7 @@ uvicorn app.main:app --reload
 
 `GET /health` returns `{"status": "ok"}` once it's up. `/analyze` and `/discover` are POST — see the auto-generated docs at `/docs`.
 
-Requires `ANTHROPIC_API_KEY` and `TAVILY_API_KEY` (both fail-fast if missing). Langfuse keys are optional — without them tracing just no-ops.
+Requires `ANTHROPIC_API_KEY` and a Tavily key (both fail-fast if missing). Tavily takes either `TAVILY_API_KEY` or a comma-separated `TAVILY_API_KEYS` list: keys are tried in order, and a key that is out of quota, rate limited, or invalid hands over to the next one. Langfuse keys are optional — without them tracing just no-ops.
 
 ### Docker
 
@@ -70,6 +70,32 @@ docker run -p 8000:8000 --env-file .env competitor-analyst-agent
 ```
 
 Multi-stage build (build tooling never reaches the runtime image), Debian-slim rather than Alpine (the dependency list is compiled-extension-heavy — Alpine's musl libc can't use manylinux wheels), runs as a non-root user, and `exec`s uvicorn so it's PID 1 and receives SIGTERM directly for clean shutdown.
+
+## Testing and evals
+
+Two layers, split by what they cost.
+
+**Unit tests** cover the deterministic parts: the recommendation rule and its thresholds, the coverage checks, URL extraction and homepage resolution, Tavily key failover, and the anti-fabrication guarantee itself (a URL that wasn't retrieved is rejected, and the constraint really does reach the JSON schema the model sees). No API keys, no network, under a second. CI runs them on every pull request.
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+**The discovery eval** runs the real `/discover` pipeline against a hand-labeled golden set of known competitors and reports recall, how many of them landed in `deep_dive`, label accuracy, model/rule agreement, and duplicates (one real company surfacing as several entries). It calls the real APIs, so it's run by hand, not in CI.
+
+```bash
+python -m evals.run_discovery_eval            # one run
+python -m evals.run_discovery_eval --runs 3   # run-to-run stability
+```
+
+The golden set is internal business data (who we consider competitors, and where we sell), so `evals/golden_set.json` is gitignored. Create it locally in the format of [`evals/golden_set.example.json`](evals/golden_set.example.json). Results are written to `evals/results/`, also gitignored.
+
+What the eval has caught so far:
+
+- **A silent failure.** When the Tavily quota ran out, discovery returned 0 companies instead of an error, because each search failure is skipped by design. Worse, when the quota ran out *mid*-run, the remaining companies were scored with no evidence and vetoed to `exclude`, a plausible-looking but wrong result. The eval now flags both cases.
+- **An unreliable label.** The model classified every known trading company as a `manufacturer`, on every run. In this industry, trading companies routinely describe themselves as factories, so the distinction isn't observable from public pages. No recommendation depends on it.
+- **Recall moves without code changes.** Live search results drift between runs, so a change only counts as an improvement if it beats that noise.
 
 ## Layout
 
@@ -86,7 +112,12 @@ app/
 ├── discovery_prompts.py    # prompts for /discover
 └── tools/
     ├── __init__.py
-    └── tavily_search.py    # Tavily search client + the search tool definition
+    └── tavily_search.py    # Tavily search client (with key failover) + the search tool definition
+tests/                      # unit tests — no network, run in CI
+evals/
+├── run_discovery_eval.py   # real-API discovery eval against the golden set
+├── metrics.py              # recall/duplicate/stability scoring (unit tested)
+└── golden_set.example.json # format only — the real golden set stays local
 ```
 
 Each layer knows the one below it, never the one above — swapping `/analyze`'s engine from a single call to the full ReAct loop touched one line of `main.py`.
@@ -99,7 +130,9 @@ The service works fine right now, and here is my plan on areas that I'd refine n
 - **Trim the final step of the deep-dive.** When the research loop finishes, the model's last turn often writes a plain-text summary before the structured report is generated. Adjusting the research prompt so the loop simply signals it's done would lower the cost per run.
 - **Add retries and a fallback model.** Search failures inside the loop are already handled: the error goes back to the model as `is_error`, so it can try another query. Adding the same resilience at the LLM API level (retrying on timeouts, or switching to a backup model) would make long runs more reliable.
 - **Add memory between runs.** Saving past results would let a repeat analysis reuse earlier research and highlight what changed since last time, which fits a weekly monitoring use case.
-- **Add tests.** The pure functions (URL handling, the recommendation rule, the coverage checks) are straightforward to cover with unit tests.
+- **Make search failures visible to the caller.** Skipping a failed search keeps one bad query from sinking a run, but when most searches fail, the response should say the data is incomplete rather than return a short list that looks complete.
+- **Fix trace nesting for the parallel steps.** Python's `ThreadPoolExecutor` doesn't carry the trace context into worker threads, so the searches and LLM calls that discovery runs in parallel show up in Langfuse as separate traces instead of under their request, and the request's total cost undercounts them. `/analyze` runs sequentially and is unaffected. The fix is to copy the context into each worker task.
+- **Make the eval reproducible.** Caching search results during evals would hold the inputs fixed, so before/after comparisons measure the code change alone, and reruns wouldn't spend search quota.
 
 ## Stack
 

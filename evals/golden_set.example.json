@@ -1,0 +1,16 @@
+{
+  "our_products": "Exporter of optometry equipment: phoropters, auto refractometers, slit lamps, lensmeters; main export market: Latin America",
+  "competitors": [
+    {
+      "name": "Example Optics Co., Ltd.",
+      "aliases": ["示例光学", "Example Optics"],
+      "domains": ["example-optics.example"],
+      "expected": "deep_dive"
+    },
+    {
+      "name": "Sample Vision Instruments",
+      "aliases": ["样例视光"],
+      "domains": ["sample-vision.example", "samplevision-group.example"]
+    }
+  ]
+}
