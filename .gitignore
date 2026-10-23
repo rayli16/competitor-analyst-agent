@@ -1,14 +1,43 @@
+# ---- Secrets ----
+# Every env file except the template. .env.* also covers .env.local,
+# .env.production etc. if they ever show up.
 .env
-venv/
+.env.*
+!.env.example
+
+# ---- Python ----
 __pycache__/
-*.pyc.DS_Store
-.DS_Store
-__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments. Python 3.13+ drops its own .gitignore inside a new
+# venv, but older versions don't — don't rely on it.
+.venv/
 venv/
 
-# Eval outputs — local artifacts, summarize them in the PR instead
-evals/results/
+# ---- Test / tooling caches ----
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ---- Logs ----
+*.log
+
+# ---- Project-specific ----
+# Eval outputs — local artifacts, summarize them in the PR instead.
+evals/results/
 # Real eval golden set — our competitor list and target markets are internal
 # business data. Only the fictional evals/golden_set.example.json is committed.
 evals/golden_set.json

@@ -5,9 +5,20 @@
 # Local dev venv — huge, platform-specific, and irrelevant: the image builds
 # its own venv from requirements.txt.
 venv/
+.venv/
 
 __pycache__/
 *.pyc
+.pytest_cache/
+.DS_Store
+
+# Dev/test-only — never needed at runtime. evals/ also holds the local,
+# internal golden set and results, which shouldn't even reach the build context.
+tests/
+evals/
+.github/
+requirements-dev.txt
+pytest.ini
 
 .git/
 .gitignore
