@@ -1,0 +1,4 @@
+# Test/eval tooling only — kept out of requirements.txt so it never reaches
+# the production image (the Dockerfile installs requirements.txt alone).
+-r requirements.txt
+pytest==9.1.1
