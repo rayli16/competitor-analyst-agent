@@ -131,7 +131,6 @@ The service works fine right now, and here is my plan on areas that I'd refine n
 - **Add retries and a fallback model.** Search failures inside the loop are already handled: the error goes back to the model as `is_error`, so it can try another query. Adding the same resilience at the LLM API level (retrying on timeouts, or switching to a backup model) would make long runs more reliable.
 - **Add memory between runs.** Saving past results would let a repeat analysis reuse earlier research and highlight what changed since last time, which fits a weekly monitoring use case.
 - **Make search failures visible to the caller.** Skipping a failed search keeps one bad query from sinking a run, but when most searches fail, the response should say the data is incomplete rather than return a short list that looks complete.
-- **Fix trace nesting for the parallel steps.** Python's `ThreadPoolExecutor` doesn't carry the trace context into worker threads, so the searches and LLM calls that discovery runs in parallel show up in Langfuse as separate traces instead of under their request, and the request's total cost undercounts them. `/analyze` runs sequentially and is unaffected. The fix is to copy the context into each worker task.
 - **Make the eval reproducible.** Caching search results during evals would hold the inputs fixed, so before/after comparisons measure the code change alone, and reruns wouldn't spend search quota.
 
 ## Stack

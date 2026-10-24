@@ -1,5 +1,8 @@
+import contextvars
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from typing import TypeVar
 from urllib.parse import urlparse
 
 from langfuse import get_client
@@ -83,6 +86,22 @@ PROFILE_SEARCH_CONCURRENCY = 15
 
 _seen_domains_lock = threading.Lock()
 
+T = TypeVar("T")
+R = TypeVar("R")
+
+
+def map_in_context(fn: Callable[[T], R], items: list[T], max_workers: int) -> list[R]:
+    # ThreadPoolExecutor doesn't carry contextvars into its worker threads, and
+    # that's where Langfuse/OpenTelemetry keep the active span — a bare
+    # pool.map made every call in a worker its own root trace instead of
+    # nesting under the request, and the request's total cost undercounted.
+    # Each item gets its own copy, taken HERE on the calling thread: copying
+    # inside the worker would only copy the worker's empty context, and one
+    # Context object can't be entered by two threads at once.
+    contexts = [contextvars.copy_context() for _ in items]
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        return list(pool.map(lambda ctx, item: ctx.run(fn, item), contexts, items))
+
 
 def dispatch_search(query: str, seen_domains: set[str]) -> list[dict[str, str]]:
     with get_client().start_as_current_observation(
@@ -118,8 +137,7 @@ def run_search_round(queries: list[str], seen_domains: set[str]) -> list[dict[st
     # Queries within a round are independent — run concurrently. I/O-bound
     # (waiting on Tavily), so a thread pool is a good fit; search() itself
     # is synchronous, not async.
-    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-        batches = pool.map(lambda q: dispatch_search(q, seen_domains), queries)
+    batches = map_in_context(lambda q: dispatch_search(q, seen_domains), queries, max_workers=len(queries))
     return [result for batch in batches for result in batch]
 
 
@@ -162,8 +180,7 @@ def extract_candidates(
     if not batches:
         return [], set()
     # Batches are independent — same concurrency pattern as run_search_round.
-    with ThreadPoolExecutor(max_workers=len(batches)) as pool:
-        batch_verdicts = pool.map(lambda batch: classify_batch(llm_client, batch), batches)
+    batch_verdicts = map_in_context(lambda batch: classify_batch(llm_client, batch), batches, max_workers=len(batches))
     verdicts = [v for verdicts in batch_verdicts for v in verdicts]
     # Checked against the FULL result set, after merging — not per-batch.
     # A per-batch check would only ever catch a batch skipping its own
@@ -289,8 +306,9 @@ def gather_company_profiles(companies: list[ResolvedCompany]) -> dict[str, list[
     tasks = [
         (company.primary_url, query) for company in companies for query in build_profile_queries(company.canonical_name)
     ]
-    with ThreadPoolExecutor(max_workers=min(len(tasks), PROFILE_SEARCH_CONCURRENCY)) as pool:
-        batches = pool.map(lambda task: dispatch_profile_search(*task), tasks)
+    batches = map_in_context(
+        lambda task: dispatch_profile_search(*task), tasks, max_workers=min(len(tasks), PROFILE_SEARCH_CONCURRENCY)
+    )
     # Grouped back by company_url here — dispatch ran as a flat pool, but
     # the scoring call needs each company's evidence kept separate.
     profiles: dict[str, list[dict[str, str]]] = {company.primary_url: [] for company in companies}
@@ -333,8 +351,9 @@ def score_companies(
     if not companies:
         return [], set()
     batches = [companies[i : i + SCORING_BATCH_SIZE] for i in range(0, len(companies), SCORING_BATCH_SIZE)]
-    with ThreadPoolExecutor(max_workers=len(batches)) as pool:
-        batch_scores = pool.map(lambda batch: score_batch(llm_client, batch, profiles, our_products), batches)
+    batch_scores = map_in_context(
+        lambda batch: score_batch(llm_client, batch, profiles, our_products), batches, max_workers=len(batches)
+    )
     scores = [s for scores in batch_scores for s in scores]
     missing = check_full_scoring_coverage(companies, scores)
     return scores, missing
