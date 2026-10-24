@@ -49,11 +49,14 @@ def test_dynamic_type_still_serializes_as_the_base_response():
     assert isinstance(report, AnalysisResponse)
 
 
-def test_no_findings_falls_back_to_unconstrained_type():
-    # Documents a known gap rather than endorsing it: with zero retrieved
-    # URLs there is no enum to build, so citations go unconstrained.
-    _, response_type = build_synthesis_message("Analyze: Acme", [])
-    assert response_type is AnalysisResponse
+def test_synthesis_refuses_to_run_without_sources():
+    # Used to fall back to an unconstrained schema here. With zero URLs there
+    # is no enum to build, so synthesis must not run at all (the agent
+    # reports no_sources instead — see tests/test_warnings.py).
+    with pytest.raises(ValueError):
+        build_synthesis_message("Analyze: Acme", [])
+    with pytest.raises(ValueError):
+        build_synthesis_message("Analyze: Acme", [("q", "ForbiddenError: plan limit")])
 
 
 def test_extraction_verdict_url_is_constrained_to_its_batch():

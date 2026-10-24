@@ -2,6 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, create_model
 
+from app.diagnostics import ResponseWarning
+
 CandidateEntityType = Literal[
     "manufacturer",
     "trading_company",
@@ -242,4 +244,8 @@ class DiscoveryResponse(BaseModel):
     # The union makes both real shapes explicit instead of quietly losing data.
     companies: list[ResolvedCompany] | list[ScoredCompany] = Field(
         description="Deduplicated candidate competitors found this run — scored if score_candidates was true"
+    )
+    warnings: list[ResponseWarning] = Field(
+        default_factory=list,
+        description="Anything that makes this result incomplete — empty when the run went cleanly",
     )

@@ -40,11 +40,10 @@ def print_run(index: int, run: dict, seconds: float) -> None:
         print("missed:           " + ", ".join(run["missed"]))
     for dup in run["duplicates"]:
         print(f"duplicate:        {dup['golden']} -> {dup['found_as']}")
-    if run["no_evidence_count"]:
-        print(
-            f"WARNING: {run['no_evidence_count']} companies scored with no evidence at all — "
-            "if several, profile searches likely failed mid-run (check Langfuse for search errors)"
-        )
+    # The pipeline's own warnings — any of them means these numbers partly
+    # reflect an incomplete run, not just the code under test.
+    for warning in run["warnings"]:
+        print(f"WARNING [{warning['code']}]: {warning['message']}")
 
 
 def main() -> None:
@@ -71,18 +70,17 @@ def main() -> None:
         with get_client().start_as_current_observation(
             name="eval_discovery", as_type="span", metadata={"run": i, "of": args.runs}
         ):
-            companies = run_discovery(llm_client, request)
+            companies, warnings = run_discovery(llm_client, request)
         seconds = time.monotonic() - started
-        run = score_run(competitors, companies)
+        run = score_run(competitors, companies, warnings)
         run["seconds"] = round(seconds, 1)
         runs.append(run)
         raw.append([c.model_dump() for c in companies])
         if not is_valid_run(run):
+            reasons = "; ".join(w["message"] for w in run["warnings"]) or "0 companies found"
             print(
-                f"\n=== run {i}  INVALID: 0 companies found ===\n"
-                "Every search likely failed (exhausted Tavily quota, bad key, network) — the "
-                "pipeline returns empty instead of erroring. Excluded from the summary; "
-                "stopping so the remaining runs don't fail the same way."
+                f"\n=== run {i}  INVALID ===\n{reasons}\n"
+                "Excluded from the summary; stopping so the remaining runs don't fail the same way."
             )
             break
         print_run(i, run, seconds)

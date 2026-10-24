@@ -7,3 +7,8 @@ import os
 # alone, and load_dotenv() won't override whatever is set here.
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-dummy-key")
 os.environ.setdefault("TAVILY_API_KEY", "test-dummy-key")
+
+# Forced, not setdefault: tests drive the real pipeline with fake searches,
+# and with tracing on, a local run (real Langfuse keys in .env) would send
+# those fake traces to the real project.
+os.environ["LANGFUSE_TRACING_ENABLED"] = "false"

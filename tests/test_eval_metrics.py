@@ -1,7 +1,8 @@
 import pytest
 
 from app.discovery_models import ScoredCompany
-from evals.metrics import aggregate_runs, load_golden, match_reason, normalize_domain, score_run
+from app.diagnostics import make_warning
+from evals.metrics import aggregate_runs, is_valid_run, load_golden, match_reason, normalize_domain, score_run
 
 
 def _scored(name: str, urls: list[str], rule: str = "deep_dive", llm: str = "deep_dive", score: float = 8.0):
@@ -100,11 +101,20 @@ def test_empty_run_is_invalid_and_excluded_from_summary():
     assert summary["recall"]["min"] == 1  # not dragged to 0 by the failed run
 
 
-def test_no_evidence_count_flags_possible_search_failure():
+def test_search_unavailable_warning_invalidates_run_and_is_recorded():
     golden = [{"name": "Acme", "domains": ["acme.com"]}]
-    blind = _scored("Blind Co", ["https://blind.com"]).model_copy(update={"info_availability": 1})
-    run = score_run(golden, [_scored("Acme", ["https://acme.com"]), blind])
-    assert run["no_evidence_count"] == 1
+    down = make_warning("search_unavailable", "all failed", stage="discovery", attempted=10, failed=10)
+    run = score_run(golden, [], [down])
+    assert is_valid_run(run) is False
+    assert run["warnings"][0]["code"] == "search_unavailable"
+    assert run["warnings"][0]["details"]["failed"] == 10
+
+
+def test_partial_failure_warning_keeps_run_valid():
+    golden = [{"name": "Acme", "domains": ["acme.com"]}]
+    partial = make_warning("partial_search_failure", "3 of 10 failed")
+    run = score_run(golden, [_scored("Acme", ["https://acme.com"])], [partial])
+    assert is_valid_run(run) is True
 
 
 def test_load_golden_rejects_empty_and_bad_labels():

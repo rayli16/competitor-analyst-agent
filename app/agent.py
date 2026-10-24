@@ -1,13 +1,15 @@
 from anthropic.types import MessageParam, ToolResultBlockParam, ToolUseBlock
 from langfuse import get_client
 
+from app.diagnostics import ResponseWarning, SearchTally, make_warning, partial_search_failure
 from app.llm import LLMClient
-from app.models import AnalysisRequest, AnalysisResponse
+from app.models import AnalysisReport, AnalysisRequest
 from app.prompts import (
     RESEARCH_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     build_synthesis_message,
     build_user_message,
+    extract_source_urls,
 )
 from app.tools.tavily_search import SEARCH_TOOL, SearchInput, TavilySearchClient
 
@@ -16,7 +18,7 @@ MAX_ITERATIONS = 5  # safety cap, not tuned — revisit once Langfuse shows real
 tavily_client = TavilySearchClient()
 
 
-def dispatch(block: ToolUseBlock) -> ToolResultBlockParam:
+def dispatch(block: ToolUseBlock, tally: SearchTally) -> ToolResultBlockParam:
     with get_client().start_as_current_observation(
         name=block.name,
         as_type="tool",
@@ -31,9 +33,11 @@ def dispatch(block: ToolUseBlock) -> ToolResultBlockParam:
             # tool_result the model can see and react to, not a crash. This
             # is the one place in the codebase that catches broadly on
             # purpose: whatever went wrong, the recovery is identical
-            # (is_error=True), so there's no type information worth keeping.
+            # (is_error=True). The type name is kept only for the warning.
             tool_span.update(output=str(e), level="ERROR", status_message=str(e))
+            tally.record(e)
             return {"type": "tool_result", "tool_use_id": block.id, "content": str(e), "is_error": True}
+        tally.record()
         tool_span.update(output=content)
         return {"type": "tool_result", "tool_use_id": block.id, "content": content}
 
@@ -55,9 +59,10 @@ def extract_findings(messages: list[MessageParam]) -> list[tuple[str, str]]:
     return findings
 
 
-def run_agentic_analysis(llm_client: LLMClient, request: AnalysisRequest) -> AnalysisResponse:
+def run_agentic_analysis(llm_client: LLMClient, request: AnalysisRequest) -> AnalysisReport:
     user_message = build_user_message(request)
     messages: list[MessageParam] = [{"role": "user", "content": user_message}]
+    tally = SearchTally()
 
     # Scoped to just the research phase, so the final synthesis generation
     # nests as a sibling of this span under `analyze`, not inside it —
@@ -70,15 +75,51 @@ def run_agentic_analysis(llm_client: LLMClient, request: AnalysisRequest) -> Ana
             stop_reason = response.stop_reason
             if stop_reason != "tool_use":
                 break
-            tool_results = [dispatch(block) for block in response.content if isinstance(block, ToolUseBlock)]
+            tool_results = [dispatch(block, tally) for block in response.content if isinstance(block, ToolUseBlock)]
             messages.append({"role": "user", "content": tool_results})
         # cap_hit is derivable from stop_reason, but spelling it out saves a
         # reader of the trace from having to remember what "tool_use" means here.
         loop_span.update(metadata={"stop_reason": stop_reason, "cap_hit": stop_reason == "tool_use"})
 
+    warnings: list[ResponseWarning] = []
+    if stop_reason == "tool_use":
+        warnings.append(
+            make_warning(
+                "iteration_cap_hit",
+                f"Research stopped at the {MAX_ITERATIONS}-iteration cap while the model still wanted to "
+                "search, so the report may be missing areas it hadn't covered yet.",
+            )
+        )
+    if tally.failed:
+        warnings.append(
+            partial_search_failure("research", tally, "The report only covers what the successful searches found.")
+        )
+
     findings = extract_findings(messages)
+    if not extract_source_urls(findings):
+        # No sources means nothing to cite, so no synthesis call at all —
+        # cheaper, and the alternative (an unconstrained schema) would let
+        # the model write sourced-looking claims from memory.
+        warnings.append(
+            make_warning(
+                "no_sources",
+                "No search returned any sources, so no report was generated. "
+                "The empty sections mean missing data, not missing products or markets.",
+                **tally.as_details("research"),
+            )
+        )
+        return AnalysisReport(
+            competitor_name=request.competitor_name,
+            summary="No report: research gathered no sources. See warnings.",
+            products=[],
+            pricing_signals=[],
+            regional_presence=[],
+            recommended_actions=[],
+            warnings=warnings,
+        )
+
     # response_type is narrowed to this run's real discovered URLs — see
-    # build_synthesis_message; the only change here is which type gets
-    # passed through, not any loop/dispatch/tracing behavior.
+    # build_synthesis_message.
     synthesis_message, response_type = build_synthesis_message(user_message, findings)
-    return llm_client.complete_structured(SYSTEM_PROMPT, synthesis_message, response_type)
+    report = llm_client.complete_structured(SYSTEM_PROMPT, synthesis_message, response_type)
+    return AnalysisReport(**report.model_dump(), warnings=warnings)

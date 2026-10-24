@@ -58,10 +58,12 @@ def extract_source_urls(findings: list[tuple[str, str]]) -> list[str]:
 def build_synthesis_message(
     user_message: str, findings: list[tuple[str, str]]
 ) -> tuple[str, type[AnalysisResponse]]:
-    if not findings:
-        return user_message + "\n\n(No search results were gathered.)", AnalysisResponse
-
     urls = extract_source_urls(findings)
+    if not urls:
+        # There's no enum to build from zero URLs, and an unconstrained schema
+        # would let the model cite anything — so no sources means no
+        # synthesis. run_agentic_analysis checks first and reports no_sources.
+        raise ValueError("build_synthesis_message needs at least one retrieved source URL")
     sections = [f"Search: {query}\nFindings: {result}" for query, result in findings]
     sources = "\n".join(f"- {url}" for url in urls)
     message = (
@@ -73,5 +75,4 @@ def build_synthesis_message(
     )
     # response_type is dynamically narrowed to this run's real URLs — the
     # schema itself won't accept a source_url that wasn't actually found.
-    response_type = build_sourced_response_type(urls) if urls else AnalysisResponse
-    return message, response_type
+    return message, build_sourced_response_type(urls)
