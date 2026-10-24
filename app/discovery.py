@@ -1,9 +1,13 @@
+import contextvars
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from typing import TypeVar
 from urllib.parse import urlparse
 
 from langfuse import get_client
 
+from app.diagnostics import AffectedCompany, ResponseWarning, SearchTally, make_warning, partial_search_failure
 from app.discovery_models import (
     CandidateScore,
     Company,
@@ -83,8 +87,24 @@ PROFILE_SEARCH_CONCURRENCY = 15
 
 _seen_domains_lock = threading.Lock()
 
+T = TypeVar("T")
+R = TypeVar("R")
 
-def dispatch_search(query: str, seen_domains: set[str]) -> list[dict[str, str]]:
+
+def map_in_context(fn: Callable[[T], R], items: list[T], max_workers: int) -> list[R]:
+    # ThreadPoolExecutor doesn't carry contextvars into its worker threads, and
+    # that's where Langfuse/OpenTelemetry keep the active span — a bare
+    # pool.map made every call in a worker its own root trace instead of
+    # nesting under the request, and the request's total cost undercounted.
+    # Each item gets its own copy, taken HERE on the calling thread: copying
+    # inside the worker would only copy the worker's empty context, and one
+    # Context object can't be entered by two threads at once.
+    contexts = [contextvars.copy_context() for _ in items]
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        return list(pool.map(lambda ctx, item: ctx.run(fn, item), contexts, items))
+
+
+def dispatch_search(query: str, seen_domains: set[str], tally: SearchTally) -> list[dict[str, str]]:
     with get_client().start_as_current_observation(
         name="search",
         as_type="tool",
@@ -94,9 +114,12 @@ def dispatch_search(query: str, seen_domains: set[str]) -> list[dict[str, str]]:
             results = tavily_client.search(query)
         except Exception as e:
             # No LLM is watching this search individually (unlike the ReAct
-            # loop's dispatch()) — log and skip, don't abort the whole run.
+            # loop's dispatch()) — skip it rather than abort the whole run,
+            # but count it: run_discovery reports failures as warnings.
             tool_span.update(output=str(e), level="ERROR", status_message=str(e))
+            tally.record(e)
             return []
+        tally.record()
         # seen_domains is shared across concurrently-running searches in the
         # same round — lock the check-and-update so counts stay accurate.
         with _seen_domains_lock:
@@ -109,7 +132,7 @@ def dispatch_search(query: str, seen_domains: set[str]) -> list[dict[str, str]]:
         return results
 
 
-def run_search_round(queries: list[str], seen_domains: set[str]) -> list[dict[str, str]]:
+def run_search_round(queries: list[str], seen_domains: set[str], tally: SearchTally) -> list[dict[str, str]]:
     if not queries:
         # ROUND_1_QUERIES is a maintained, hand-edited constant — guard the
         # accidentally-empty case rather than let ThreadPoolExecutor(max_workers=0)
@@ -118,8 +141,7 @@ def run_search_round(queries: list[str], seen_domains: set[str]) -> list[dict[st
     # Queries within a round are independent — run concurrently. I/O-bound
     # (waiting on Tavily), so a thread pool is a good fit; search() itself
     # is synchronous, not async.
-    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-        batches = pool.map(lambda q: dispatch_search(q, seen_domains), queries)
+    batches = map_in_context(lambda q: dispatch_search(q, seen_domains, tally), queries, max_workers=len(queries))
     return [result for batch in batches for result in batch]
 
 
@@ -162,8 +184,7 @@ def extract_candidates(
     if not batches:
         return [], set()
     # Batches are independent — same concurrency pattern as run_search_round.
-    with ThreadPoolExecutor(max_workers=len(batches)) as pool:
-        batch_verdicts = pool.map(lambda batch: classify_batch(llm_client, batch), batches)
+    batch_verdicts = map_in_context(lambda batch: classify_batch(llm_client, batch), batches, max_workers=len(batches))
     verdicts = [v for verdicts in batch_verdicts for v in verdicts]
     # Checked against the FULL result set, after merging — not per-batch.
     # A per-batch check would only ever catch a batch skipping its own
@@ -172,13 +193,15 @@ def extract_candidates(
     return verdicts, missing
 
 
-def gather_and_classify_candidates(llm_client: LLMClient) -> tuple[list[CandidateVerdict], set[str]]:
+def gather_and_classify_candidates(
+    llm_client: LLMClient, tally: SearchTally
+) -> tuple[list[CandidateVerdict], set[str]]:
     # Seed expansion (a second, "companies similar to X" search round) was
     # tried and cut: measured on a real run, after fixing seed selection to
     # only expand from confident manufacturer/trading_company verdicts, it
     # still contributed zero companies round 1 wouldn't have found anyway.
     seen_domains: set[str] = set()
-    raw_results = deduplicate_by_url(run_search_round(ROUND_1_QUERIES, seen_domains))
+    raw_results = deduplicate_by_url(run_search_round(ROUND_1_QUERIES, seen_domains, tally))
     if not raw_results:
         return [], set()
     return extract_candidates(llm_client, raw_results)
@@ -257,7 +280,9 @@ def build_profile_queries(company_name: str) -> list[str]:
     return [template.format(company_name=company_name) for template in PROFILE_QUERY_TEMPLATES]
 
 
-def dispatch_profile_search(company_url: str, query: str) -> list[dict[str, str]]:
+def dispatch_profile_search(company_url: str, query: str, tally: SearchTally) -> list[dict[str, str]] | None:
+    # Returns None (not []) on failure: "the search failed" and "the search
+    # found nothing" mean different things to gather_company_profiles.
     # A separate function from dispatch_search, not a reuse with a throwaway
     # seen_domains — new_domain_count means "found a company we haven't seen
     # yet," which isn't a meaningful concept here: profile search gathers
@@ -272,14 +297,22 @@ def dispatch_profile_search(company_url: str, query: str) -> list[dict[str, str]
             results = tavily_client.search(query, max_results=3)
         except Exception as e:
             tool_span.update(output=str(e), level="ERROR", status_message=str(e))
-            return []
+            tally.record(e)
+            return None
+        tally.record()
         tool_span.update(output=[r["url"] for r in results], metadata={"result_count": len(results)})
         return results
 
 
-def gather_company_profiles(companies: list[ResolvedCompany]) -> dict[str, list[dict[str, str]]]:
+def gather_company_profiles(
+    companies: list[ResolvedCompany], tally: SearchTally
+) -> tuple[dict[str, list[dict[str, str]]], set[str]]:
+    # Second value: companies whose profile searches ALL failed. Scoring
+    # them on zero evidence is what produced confident-looking "exclude"
+    # verdicts (vetoed for info_availability=1) when the search quota ran
+    # out mid-run — a wrong answer, not a missing one.
     if not companies:
-        return {}
+        return {}, set()
     # One flat pool of every (company, query) task instead of batching per
     # company — per-company batching would mean company 15 doesn't start
     # until companies 1-14 have each finished all 3 of their queries. A flat
@@ -289,14 +322,20 @@ def gather_company_profiles(companies: list[ResolvedCompany]) -> dict[str, list[
     tasks = [
         (company.primary_url, query) for company in companies for query in build_profile_queries(company.canonical_name)
     ]
-    with ThreadPoolExecutor(max_workers=min(len(tasks), PROFILE_SEARCH_CONCURRENCY)) as pool:
-        batches = pool.map(lambda task: dispatch_profile_search(*task), tasks)
+    batches = map_in_context(
+        lambda task: dispatch_profile_search(*task, tally),
+        tasks,
+        max_workers=min(len(tasks), PROFILE_SEARCH_CONCURRENCY),
+    )
     # Grouped back by company_url here — dispatch ran as a flat pool, but
     # the scoring call needs each company's evidence kept separate.
     profiles: dict[str, list[dict[str, str]]] = {company.primary_url: [] for company in companies}
+    succeeded: set[str] = set()
     for (company_url, _query), batch in zip(tasks, batches):
-        profiles[company_url].extend(batch)
-    return profiles
+        if batch is not None:
+            succeeded.add(company_url)
+            profiles[company_url].extend(batch)
+    return profiles, set(profiles) - succeeded
 
 
 def check_full_scoring_coverage(companies: list[ResolvedCompany], scores: list[CandidateScore]) -> set[str]:
@@ -333,8 +372,9 @@ def score_companies(
     if not companies:
         return [], set()
     batches = [companies[i : i + SCORING_BATCH_SIZE] for i in range(0, len(companies), SCORING_BATCH_SIZE)]
-    with ThreadPoolExecutor(max_workers=len(batches)) as pool:
-        batch_scores = pool.map(lambda batch: score_batch(llm_client, batch, profiles, our_products), batches)
+    batch_scores = map_in_context(
+        lambda batch: score_batch(llm_client, batch, profiles, our_products), batches, max_workers=len(batches)
+    )
     scores = [s for scores in batch_scores for s in scores]
     missing = check_full_scoring_coverage(companies, scores)
     return scores, missing
@@ -386,18 +426,50 @@ def merge_scores(companies: list[ResolvedCompany], scores: list[CandidateScore])
     return merged
 
 
-def run_discovery(llm_client: LLMClient, request: DiscoveryRequest) -> list[ResolvedCompany] | list[ScoredCompany]:
+def run_discovery(
+    llm_client: LLMClient, request: DiscoveryRequest
+) -> tuple[list[ResolvedCompany] | list[ScoredCompany], list[ResponseWarning]]:
+    warnings: list[ResponseWarning] = []
+
     # Own span for search+classify — mirrors agent_loop's pattern: a
     # distinct job gets its own grouping, so the trace reads as nested
     # spans, not a flat pile of tool/generation calls directly under the route.
+    search_tally = SearchTally()
     with get_client().start_as_current_observation(name="gather_candidates", as_type="span") as gather_span:
-        verdicts, missing = gather_and_classify_candidates(llm_client)
+        verdicts, missing = gather_and_classify_candidates(llm_client, search_tally)
         gather_span.update(metadata={"candidate_count": len(verdicts)})
+
+    if search_tally.all_failed:
+        # Nothing was retrieved, so there's nothing to classify. Said
+        # explicitly because an empty list otherwise reads as "no competitors".
+        warnings.append(
+            make_warning(
+                "search_unavailable",
+                f"All {search_tally.attempted} discovery searches failed ({search_tally.describe_errors()}). "
+                "The empty result means search was unavailable, not that no competitors exist.",
+                **search_tally.as_details("discovery"),
+            )
+        )
+        return [], warnings
+    if search_tally.failed:
+        warnings.append(
+            partial_search_failure(
+                "discovery", search_tally, "Companies only those searches would have surfaced may be missing."
+            )
+        )
 
     if missing:
         # Surfaced on the currently-active span (the route's root), not
         # swallowed — see check_full_coverage.
         get_client().update_current_span(level="WARNING", metadata={"extraction_coverage_gap": sorted(missing)})
+        warnings.append(
+            make_warning(
+                "classification_incomplete",
+                f"The model skipped {len(missing)} search results when classifying, so any company "
+                "found only in those results is missing.",
+                skipped=len(missing),
+            )
+        )
 
     companies = deduplicate_candidates(llm_client, verdicts)
 
@@ -405,14 +477,45 @@ def run_discovery(llm_client: LLMClient, request: DiscoveryRequest) -> list[Reso
         resolved = resolve_primary_urls(companies)
 
     if not request.score_candidates:
-        return resolved
+        return resolved, warnings
 
+    profile_tally = SearchTally()
     with get_client().start_as_current_observation(name="score_candidates", as_type="span") as score_span:
-        profiles = gather_company_profiles(resolved)
-        scores, missing_scores = score_companies(llm_client, resolved, profiles, request.our_products)
+        profiles, no_evidence = gather_company_profiles(resolved, profile_tally)
+        scoreable = [c for c in resolved if c.primary_url not in no_evidence]
+        scores, missing_scores = score_companies(llm_client, scoreable, profiles, request.our_products)
         score_span.update(metadata={"scored_count": len(scores)})
+
+    if profile_tally.failed:
+        warnings.append(
+            partial_search_failure(
+                "profile", profile_tally, "Scores for the affected companies are based on less evidence."
+            )
+        )
+    if no_evidence:
+        affected = [AffectedCompany(name=c.canonical_name, url=c.primary_url) for c in resolved if c.primary_url in no_evidence]
+        warnings.append(
+            make_warning(
+                "evidence_unavailable",
+                f"Every profile search failed for {len(affected)} companies, so they were left unscored rather "
+                f"than scored on no evidence: {', '.join(a.name for a in affected)}. This says nothing about "
+                "their relevance.",
+                companies=affected,
+            )
+        )
 
     if missing_scores:
         get_client().update_current_span(level="WARNING", metadata={"scoring_coverage_gap": sorted(missing_scores)})
+        affected = [
+            AffectedCompany(name=c.canonical_name, url=c.primary_url) for c in scoreable if c.primary_url in missing_scores
+        ]
+        warnings.append(
+            make_warning(
+                "scoring_incomplete",
+                f"The model skipped {len(affected)} companies when scoring, so they're missing: "
+                f"{', '.join(a.name for a in affected)}.",
+                companies=affected,
+            )
+        )
 
-    return merge_scores(resolved, scores)
+    return merge_scores(scoreable, scores), warnings

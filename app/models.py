@@ -2,6 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, create_model
 
+from app.diagnostics import ResponseWarning
+
 class AnalysisRequest(BaseModel):
     """ 
     Input for analysis. Agent gathers its own data
@@ -70,6 +72,16 @@ class AnalysisResponse(BaseModel):
     # verifiable fact — there's nothing to cite a URL for.
     recommended_actions: list[str] = Field(
         description="Concrete suggested responses based on the findings"
+    )
+
+
+class AnalysisReport(AnalysisResponse):
+    # What /analyze returns. A subclass rather than a field on
+    # AnalysisResponse, because AnalysisResponse is also the schema the model
+    # fills in — warnings are written by code, and the model never sees them.
+    warnings: list[ResponseWarning] = Field(
+        default_factory=list,
+        description="Anything that makes this report incomplete — empty when the run went cleanly",
     )
 
 

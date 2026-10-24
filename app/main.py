@@ -8,7 +8,7 @@ from app.agent import run_agentic_analysis
 from app.discovery import run_discovery
 from app.discovery_models import DiscoveryRequest, DiscoveryResponse
 from app.llm import LLMClient
-from app.models import AnalysisRequest, AnalysisResponse
+from app.models import AnalysisReport, AnalysisRequest
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ def health() -> dict[str, str]:
 
 @app.post("/analyze")
 @observe(name="analyze", as_type="span")
-def analyze(request: AnalysisRequest) -> AnalysisResponse:
+def analyze(request: AnalysisRequest) -> AnalysisReport:
     try:
         return run_agentic_analysis(llm_client, request)
     except ValidationError as e:
@@ -46,9 +46,9 @@ def analyze(request: AnalysisRequest) -> AnalysisResponse:
 @observe(name="discover", as_type="span")
 def discover(request: DiscoveryRequest) -> DiscoveryResponse:
     try:
-        companies = run_discovery(llm_client, request)
+        companies, warnings = run_discovery(llm_client, request)
     except ValidationError as e:
         logger.exception("complete_structured validation failed in /discover")
         get_client().update_current_span(level="ERROR", status_message=str(e))
         raise HTTPException(status_code=502, detail="Model returned data that didn't match the expected schema.")
-    return DiscoveryResponse(companies=companies)
+    return DiscoveryResponse(companies=companies, warnings=warnings)
