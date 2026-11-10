@@ -148,7 +148,7 @@ Measured from Langfuse traces of real runs:
 | `/analyze` | 70–160s | $0.09–0.22 |
 | `/discover` with scoring | ~90s | $0.15–0.30 |
 
-Search is billed separately by Tavily; a `/discover` run makes about 65 searches. Deep-dive cost grows with each round because the full conversation is resent, so the round limit also caps cost.
+Search is billed separately by Tavily; a `/discover` run makes about 65 searches. Deep-dive cost grows with each round because the full conversation is resent, so the round limit also caps cost. Research ends with a `finish_research` tool call rather than a written summary, which cut the last research turn from ~25s to ~2s.
 
 ## Design principles
 
@@ -176,7 +176,6 @@ Search is billed separately by Tavily; a `/discover` run makes about 65 searches
 
 ## Roadmap
 
-- Remove the plain-text summary the research loop writes before the structured report.
 - Retry or fall back to another model when the LLM API fails.
 - Store past runs so repeat checks report only changes.
 - Cache search results in evals so comparisons use fixed inputs.
