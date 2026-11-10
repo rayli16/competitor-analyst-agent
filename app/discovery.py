@@ -7,7 +7,14 @@ from urllib.parse import urlparse
 
 from langfuse import get_client
 
-from app.diagnostics import AffectedCompany, ResponseWarning, SearchTally, make_warning, partial_search_failure
+from app.diagnostics import (
+    AffectedCompany,
+    ResponseWarning,
+    SearchTally,
+    make_warning,
+    model_fallback,
+    partial_search_failure,
+)
 from app.discovery_models import (
     CandidateScore,
     Company,
@@ -28,7 +35,7 @@ from app.discovery_prompts import (
     build_extraction_message,
     build_scoring_message,
 )
-from app.llm import LLMClient
+from app.llm import LLMClient, track_fallbacks
 from app.tools.tavily_search import TavilySearchClient
 
 tavily_client = TavilySearchClient()
@@ -427,6 +434,16 @@ def merge_scores(companies: list[ResolvedCompany], scores: list[CandidateScore])
 
 
 def run_discovery(
+    llm_client: LLMClient, request: DiscoveryRequest
+) -> tuple[list[ResolvedCompany] | list[ScoredCompany], list[ResponseWarning]]:
+    with track_fallbacks() as fallbacks:
+        companies, warnings = _run_discovery(llm_client, request)
+    if fallbacks.switched:
+        warnings.append(model_fallback(fallbacks))
+    return companies, warnings
+
+
+def _run_discovery(
     llm_client: LLMClient, request: DiscoveryRequest
 ) -> tuple[list[ResolvedCompany] | list[ScoredCompany], list[ResponseWarning]]:
     warnings: list[ResponseWarning] = []

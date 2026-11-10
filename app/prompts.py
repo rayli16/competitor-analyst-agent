@@ -31,8 +31,9 @@ RESEARCH_SYSTEM_PROMPT = (
     "a competitor using web search. For questions where current information "
     "would change the answer, search before answering rather than answering "
     "from memory. Search for products, pricing signals, regional presence, "
-    "and recent news. Once you have enough to cover those areas, call "
-    "finish_research instead of replying in text — the report is written in "
+    "and recent news, at most 3 searches per turn. Once you have enough to "
+    "cover those areas, call finish_research instead of replying in text — "
+    "the report is written in "
     "a separate step from your search results, so any analysis you write "
     "here is discarded."
 )

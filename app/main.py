@@ -1,13 +1,15 @@
 import logging
 
-from fastapi import FastAPI, HTTPException
+from anthropic import APIConnectionError, APIStatusError, APITimeoutError
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from langfuse import get_client, observe
 from pydantic import ValidationError
 
 from app.agent import run_agentic_analysis
 from app.discovery import run_discovery
 from app.discovery_models import DiscoveryRequest, DiscoveryResponse
-from app.llm import LLMClient
+from app.llm import FALLBACK_ERRORS, LLMClient, get_fallback_endpoint
 from app.models import AnalysisReport, AnalysisRequest
 
 logger = logging.getLogger(__name__)
@@ -16,13 +18,32 @@ app = FastAPI(title="Competitor Analysis Agent")
 
 # Built at import time, not inside a route — if the API key is missing, we
 # want the process to fail on startup, not on the first request that hits it.
-llm_client = LLMClient()
+llm_client = LLMClient(fallback=get_fallback_endpoint())
 
 
 # Liveness check — deliberately independent of the LLM call path.
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.exception_handler(APITimeoutError)
+def model_timeout(request: Request, exc: APITimeoutError) -> JSONResponse:
+    # Reached only when the fallback (if any) timed out too. 504, not a bare
+    # 500: the model service was too slow, not a bug in this app.
+    logger.exception("LLM call timed out")
+    return JSONResponse(status_code=504, content={"detail": "The model service timed out. Try again later."})
+
+
+@app.exception_handler(APIStatusError)
+@app.exception_handler(APIConnectionError)
+def model_unavailable(request: Request, exc: Exception) -> JSONResponse:
+    if isinstance(exc, APIStatusError) and not isinstance(exc, FALLBACK_ERRORS):
+        # 400/422 from the model API means we sent a bad request: our bug.
+        logger.exception("LLM API rejected the request")
+        return JSONResponse(status_code=500, content={"detail": "Internal error calling the model service."})
+    logger.exception("LLM service unavailable")
+    return JSONResponse(status_code=503, content={"detail": "The model service is unavailable. Try again later."})
 
 
 @app.post("/analyze")

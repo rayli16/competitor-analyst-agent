@@ -1,8 +1,9 @@
 from anthropic.types import MessageParam, ToolParam, ToolResultBlockParam, ToolUseBlock
 from langfuse import get_client
 
-from app.diagnostics import ResponseWarning, SearchTally, make_warning, partial_search_failure
-from app.llm import LLMClient
+from app.diagnostics import ResponseWarning, SearchTally, make_warning, model_fallback, partial_search_failure
+from app.discovery import map_in_context
+from app.llm import LLMClient, track_fallbacks
 from app.models import AnalysisReport, AnalysisRequest
 from app.prompts import (
     RESEARCH_SYSTEM_PROMPT,
@@ -14,6 +15,11 @@ from app.prompts import (
 from app.tools.tavily_search import SEARCH_TOOL, SearchInput, TavilySearchClient
 
 MAX_ITERATIONS = 5  # safety cap, not tuned — revisit once Langfuse shows real iteration counts
+
+# Bounds the findings synthesis has to read. Claude issues 1-3 searches per
+# turn; Kimi issued 4-8, and a run reached 38 searches / 210k chars of
+# findings — Kimi then ran 400s and hit max_tokens mid-JSON writing the report.
+MAX_SEARCHES_PER_TURN = 3
 
 # How the model ends research. Without it, the last turn ends on plain text:
 # Langfuse showed that turn writing a full 2,000-2,700-token analysis every
@@ -74,6 +80,14 @@ def extract_findings(messages: list[MessageParam]) -> list[tuple[str, str]]:
 
 
 def run_agentic_analysis(llm_client: LLMClient, request: AnalysisRequest) -> AnalysisReport:
+    with track_fallbacks() as fallbacks:
+        report = _run_agentic_analysis(llm_client, request)
+    if fallbacks.switched:
+        report.warnings.append(model_fallback(fallbacks))
+    return report
+
+
+def _run_agentic_analysis(llm_client: LLMClient, request: AnalysisRequest) -> AnalysisReport:
     user_message = build_user_message(request)
     messages: list[MessageParam] = [{"role": "user", "content": user_message}]
     tally = SearchTally()
@@ -99,7 +113,20 @@ def run_agentic_analysis(llm_client: LLMClient, request: AnalysisRequest) -> Ana
                 # Searches issued alongside finish_research still run — their
                 # results feed the report. No further model turn follows a
                 # finish, so finish_research itself never needs a tool_result.
-                messages.append({"role": "user", "content": [dispatch(block, tally) for block in searches]})
+                run, skipped = searches[:MAX_SEARCHES_PER_TURN], searches[MAX_SEARCHES_PER_TURN:]
+                results = map_in_context(lambda block: dispatch(block, tally), run, max_workers=len(run))
+                # Every tool_use still needs a tool_result, so over-limit
+                # calls get an error the model can see and re-issue later.
+                results += [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": f"Not run: at most {MAX_SEARCHES_PER_TURN} searches per turn.",
+                        "is_error": True,
+                    }
+                    for block in skipped
+                ]
+                messages.append({"role": "user", "content": results})
             if len(searches) < len(tool_uses):
                 finished_by = "finish_tool"
                 break
