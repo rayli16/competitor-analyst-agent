@@ -1,4 +1,4 @@
-from anthropic.types import MessageParam, ToolResultBlockParam, ToolUseBlock
+from anthropic.types import MessageParam, ToolParam, ToolResultBlockParam, ToolUseBlock
 from langfuse import get_client
 
 from app.diagnostics import ResponseWarning, SearchTally, make_warning, partial_search_failure
@@ -14,6 +14,20 @@ from app.prompts import (
 from app.tools.tavily_search import SEARCH_TOOL, SearchInput, TavilySearchClient
 
 MAX_ITERATIONS = 5  # safety cap, not tuned — revisit once Langfuse shows real iteration counts
+
+# How the model ends research. Without it, the last turn ends on plain text:
+# Langfuse showed that turn writing a full 2,000-2,700-token analysis every
+# time — ~25s per run — which synthesis then discards and rewrites as the
+# structured report. A tool call ends the loop in a few tokens instead.
+FINISH_TOOL: ToolParam = {
+    "name": "finish_research",
+    "description": (
+        "Call this once your searches cover the competitor's products, pricing signals, "
+        "regional presence, and recent news. It ends research. The report is written "
+        "separately from your search results, so don't write any analysis or summary."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
 
 tavily_client = TavilySearchClient()
 
@@ -68,21 +82,31 @@ def run_agentic_analysis(llm_client: LLMClient, request: AnalysisRequest) -> Ana
     # nests as a sibling of this span under `analyze`, not inside it —
     # they're two distinct jobs (research vs. write-the-report).
     with get_client().start_as_current_observation(name="agent_loop", as_type="span") as loop_span:
-        stop_reason: str | None = None
+        finished_by: str | None = None
         for _ in range(MAX_ITERATIONS):
-            response = llm_client.complete_with_tools(RESEARCH_SYSTEM_PROMPT, messages, tools=[SEARCH_TOOL])
+            response = llm_client.complete_with_tools(
+                RESEARCH_SYSTEM_PROMPT, messages, tools=[SEARCH_TOOL, FINISH_TOOL]
+            )
             messages.append({"role": "assistant", "content": response.content})
-            stop_reason = response.stop_reason
-            if stop_reason != "tool_use":
+            tool_uses = [block for block in response.content if isinstance(block, ToolUseBlock)]
+            if not tool_uses:
+                # Stopped without calling finish_research. Still a finish,
+                # just the expensive kind: the turn is plain-text output.
+                finished_by = "end_turn"
                 break
-            tool_results = [dispatch(block, tally) for block in response.content if isinstance(block, ToolUseBlock)]
-            messages.append({"role": "user", "content": tool_results})
-        # cap_hit is derivable from stop_reason, but spelling it out saves a
-        # reader of the trace from having to remember what "tool_use" means here.
-        loop_span.update(metadata={"stop_reason": stop_reason, "cap_hit": stop_reason == "tool_use"})
+            searches = [block for block in tool_uses if block.name != FINISH_TOOL["name"]]
+            if searches:
+                # Searches issued alongside finish_research still run — their
+                # results feed the report. No further model turn follows a
+                # finish, so finish_research itself never needs a tool_result.
+                messages.append({"role": "user", "content": [dispatch(block, tally) for block in searches]})
+            if len(searches) < len(tool_uses):
+                finished_by = "finish_tool"
+                break
+        loop_span.update(metadata={"finished_by": finished_by, "cap_hit": finished_by is None})
 
     warnings: list[ResponseWarning] = []
-    if stop_reason == "tool_use":
+    if finished_by is None:
         warnings.append(
             make_warning(
                 "iteration_cap_hit",

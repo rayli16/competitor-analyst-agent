@@ -175,20 +175,34 @@ def test_model_skipping_a_company_when_scoring_is_reported(search):
 
 
 class FakeAgentLLM:
-    """Wants to search on every turn (so it runs to the cap) unless
-    stop_after is set; complete_structured is only allowed when sources exist."""
+    """Searches on every turn (so it runs to the cap) unless stop_after is
+    set. How it stops: stop_with="finish_tool" calls finish_research,
+    "end_turn" replies in plain text; search_on_final_turn also issues one
+    last search in the same turn as finish_research."""
 
-    def __init__(self, stop_after: int | None = None) -> None:
+    def __init__(
+        self, stop_after: int | None = None, stop_with: str = "finish_tool", search_on_final_turn: bool = False
+    ) -> None:
         self.stop_after = stop_after
+        self.stop_with = stop_with
+        self.search_on_final_turn = search_on_final_turn
         self.turns = 0
         self.synthesized = False
+        self.offered_tools: list[str] = []
+
+    def _search(self) -> ToolUseBlock:
+        return ToolUseBlock(type="tool_use", id=f"s{self.turns}", name="search", input={"query": f"q{self.turns}"})
 
     def complete_with_tools(self, system_prompt, messages, tools):
         self.turns += 1
-        if self.stop_after is not None and self.turns > self.stop_after:
+        self.offered_tools = [t["name"] for t in tools]
+        if self.stop_after is None or self.turns <= self.stop_after:
+            return SimpleNamespace(content=[self._search()], stop_reason="tool_use")
+        if self.stop_with == "end_turn":
             return SimpleNamespace(content=[], stop_reason="end_turn")
-        block = ToolUseBlock(type="tool_use", id=f"t{self.turns}", name="search", input={"query": f"q{self.turns}"})
-        return SimpleNamespace(content=[block], stop_reason="tool_use")
+        finish = ToolUseBlock(type="tool_use", id=f"f{self.turns}", name="finish_research", input={})
+        content = [self._search(), finish] if self.search_on_final_turn else [finish]
+        return SimpleNamespace(content=content, stop_reason="tool_use")
 
     def complete_structured(self, system_prompt, message, output_format, output_config=None):
         self.synthesized = True
@@ -230,6 +244,51 @@ def test_clean_analysis_has_no_warnings_and_keeps_report_shape(search):
     assert isinstance(report, AnalysisResponse)
     # warnings is code-only: it must never be part of the schema the model fills in
     assert "warnings" not in AnalysisResponse.model_json_schema()["properties"]
+
+
+# ---- how the research loop ends ----
+
+
+def test_finish_tool_is_offered_and_ends_the_loop(search):
+    search(FakeSearch())
+    llm = FakeAgentLLM(stop_after=2)
+    report = agent.run_agentic_analysis(llm, AnalysisRequest(competitor_name="Acme"))
+    assert "finish_research" in llm.offered_tools
+    assert llm.turns == 3  # 2 search turns + the finishing turn, nothing after
+    assert report.warnings == []
+    assert llm.synthesized is True
+
+
+def test_plain_text_ending_still_counts_as_finished(search):
+    # The model may ignore the tool and just reply. That's slower, not a cap hit.
+    search(FakeSearch())
+    llm = FakeAgentLLM(stop_after=1, stop_with="end_turn")
+    report = agent.run_agentic_analysis(llm, AnalysisRequest(competitor_name="Acme"))
+    assert llm.turns == 2
+    assert report.warnings == []
+
+
+def test_search_issued_with_finish_still_runs_and_feeds_the_report(search):
+    searched = []
+
+    class RecordingSearch(FakeSearch):
+        def search(self, query, max_results=5):
+            searched.append(query)
+            return super().search(query, max_results)
+
+    search(RecordingSearch())
+    llm = FakeAgentLLM(stop_after=1, search_on_final_turn=True)
+    agent.run_agentic_analysis(llm, AnalysisRequest(competitor_name="Acme"))
+    assert searched == ["q1", "q2"]  # q2 came in the same turn as finish_research
+    assert llm.turns == 2
+
+
+def test_finish_without_any_search_reports_no_sources(search):
+    search(FakeSearch())
+    llm = FakeAgentLLM(stop_after=0)
+    report = agent.run_agentic_analysis(llm, AnalysisRequest(competitor_name="Acme"))
+    assert llm.synthesized is False
+    assert codes(report.warnings) == ["no_sources"]
 
 
 def test_search_tally_counts_by_error_type():
