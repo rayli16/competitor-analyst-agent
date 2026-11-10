@@ -51,6 +51,8 @@ The image is a multi-stage build, runs as a non-root user, and runs uvicorn as P
 | `TAVILY_API_KEYS` or `TAVILY_API_KEY` | Yes | Web search. `TAVILY_API_KEYS` takes a comma-separated list; a key that is out of quota, rate limited, or invalid hands over to the next. |
 | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | No | Tracing. Without them, tracing is disabled. |
 | `LANGFUSE_BASE_URL` | No | Defaults to Langfuse Cloud. |
+| `MOONSHOT_API_KEY` | No | Fallback model (`kimi-k3.1-pro-highspeed` at low effort; override with `MOONSHOT_MODEL`). When Claude fails after the SDK's retries (outage, overload, rate limit, bad key), the rest of the request runs on Kimi. Without it, the request fails as before. |
+| `MOONSHOT_BASE_URL` | No | Defaults to `https://api.moonshot.ai/anthropic`. Keys from platform.moonshot.cn need `https://api.moonshot.cn/anthropic`. |
 
 ## Usage
 
@@ -113,6 +115,7 @@ A failed search is skipped so that one failure does not end the run. Both endpoi
 | `scoring_incomplete` | warning | The model skipped some companies when scoring. Listed in `details.companies`. |
 | `classification_incomplete` | info | The model skipped some search results when classifying. |
 | `iteration_cap_hit` | info | The deep-dive reached its 5-round limit while still searching. |
+| `model_fallback` | info | Claude failed after retries, so the fallback model (Kimi) handled the rest of the request. |
 
 ## Testing and evaluation
 
@@ -176,7 +179,6 @@ Search is billed separately by Tavily; a `/discover` run makes about 65 searches
 
 ## Roadmap
 
-- Retry or fall back to another model when the LLM API fails.
 - Store past runs so repeat checks report only changes.
 - Cache search results in evals so comparisons use fixed inputs.
 - Merge companies that appear under both a Chinese and an English name.

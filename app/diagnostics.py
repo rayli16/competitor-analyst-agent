@@ -18,6 +18,7 @@ WarningCode = Literal[
     "scoring_incomplete",  # the model skipped some companies when scoring
     "no_sources",  # deep-dive gathered no sources, so no report was generated
     "iteration_cap_hit",  # deep-dive research stopped at the iteration cap, not by choice
+    "model_fallback",  # the primary model failed, so the fallback model handled the rest of the request
 ]
 
 Severity = Literal["error", "warning", "info"]
@@ -33,6 +34,7 @@ SEVERITY: dict[str, Severity] = {
     "scoring_incomplete": "warning",
     "classification_incomplete": "info",
     "iteration_cap_hit": "info",
+    "model_fallback": "info",
 }
 
 SearchStage = Literal["discovery", "profile", "research"]
@@ -57,6 +59,7 @@ class WarningDetails(BaseModel):
     )
     skipped: int | None = Field(default=None, description="Inputs the model skipped (classification_incomplete)")
     companies: list[AffectedCompany] = Field(default_factory=list, description="Companies this warning is about")
+    model: str | None = Field(default=None, description="The fallback model that took over (model_fallback)")
 
 
 class ResponseWarning(BaseModel):
@@ -72,6 +75,10 @@ def make_warning(code: WarningCode, message: str, **details) -> ResponseWarning:
     # Severity comes from SEVERITY, never from the call site, so the same
     # code can't end up styled two different ways.
     return ResponseWarning(code=code, severity=SEVERITY[code], message=message, details=WarningDetails(**details))
+
+
+def describe_errors(errors: Counter[str]) -> str:
+    return ", ".join(f"{name} ×{count}" for name, count in errors.most_common())
 
 
 class SearchTally:
@@ -99,7 +106,7 @@ class SearchTally:
         return self.attempted > 0 and self.failed == self.attempted
 
     def describe_errors(self) -> str:
-        return ", ".join(f"{name} ×{count}" for name, count in self.errors.most_common())
+        return describe_errors(self.errors)
 
     def as_details(self, stage: SearchStage) -> dict:
         return {"stage": stage, "attempted": self.attempted, "failed": self.failed, "error_types": dict(self.errors)}
@@ -110,4 +117,33 @@ def partial_search_failure(stage: SearchStage, tally: SearchTally, impact: str) 
         "partial_search_failure",
         f"{tally.failed} of {tally.attempted} {stage} searches failed ({tally.describe_errors()}). {impact}",
         **tally.as_details(stage),
+    )
+
+
+class FallbackTally:
+    """Primary-model failures within one request, across worker threads. The
+    first failure switches the rest of the request to the fallback model."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.errors: Counter[str] = Counter()
+        self.model: str | None = None
+
+    def record(self, error: Exception, fallback_model: str) -> None:
+        with self._lock:
+            self.errors[type(error).__name__] += 1
+            self.model = fallback_model
+
+    @property
+    def switched(self) -> bool:
+        return bool(self.errors)
+
+
+def model_fallback(tally: FallbackTally) -> ResponseWarning:
+    return make_warning(
+        "model_fallback",
+        f"The primary model failed ({describe_errors(tally.errors)}), so {tally.model} handled the rest "
+        "of this request. Output may read differently from a normal run.",
+        model=tally.model,
+        error_types=dict(tally.errors),
     )

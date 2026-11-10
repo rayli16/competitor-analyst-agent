@@ -283,6 +283,38 @@ def test_search_issued_with_finish_still_runs_and_feeds_the_report(search):
     assert llm.turns == 2
 
 
+def test_searches_beyond_the_per_turn_cap_are_not_run(search):
+    searched = []
+
+    class RecordingSearch(FakeSearch):
+        def search(self, query, max_results=5):
+            searched.append(query)
+            return super().search(query, max_results)
+
+    class GreedyLLM(FakeAgentLLM):
+        # One turn asking for 5 searches at once, then finish.
+        def complete_with_tools(self, system_prompt, messages, tools):
+            self.turns += 1
+            if self.turns == 1:
+                blocks = [
+                    ToolUseBlock(type="tool_use", id=f"s{i}", name="search", input={"query": f"q{i}"}) for i in range(5)
+                ]
+                return SimpleNamespace(content=blocks, stop_reason="tool_use")
+            self.last_results = messages[-1]["content"]
+            finish = ToolUseBlock(type="tool_use", id="f", name="finish_research", input={})
+            return SimpleNamespace(content=[finish], stop_reason="tool_use")
+
+    search(RecordingSearch())
+    llm = GreedyLLM()
+    report = agent.run_agentic_analysis(llm, AnalysisRequest(competitor_name="Acme"))
+    assert sorted(searched) == ["q0", "q1", "q2"]
+    # every tool_use still got a result, in order; the skipped ones say why
+    assert [r["tool_use_id"] for r in llm.last_results] == ["s0", "s1", "s2", "s3", "s4"]
+    assert [r.get("is_error", False) for r in llm.last_results] == [False, False, False, True, True]
+    # skipped is not failed: no partial_search_failure for searches we chose not to run
+    assert report.warnings == []
+
+
 def test_finish_without_any_search_reports_no_sources(search):
     search(FakeSearch())
     llm = FakeAgentLLM(stop_after=0)

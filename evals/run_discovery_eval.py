@@ -21,7 +21,7 @@ from langfuse import get_client
 
 from app.discovery import run_discovery
 from app.discovery_models import DiscoveryRequest
-from app.llm import LLMClient
+from app.llm import LLMClient, get_fallback_endpoint
 from evals.metrics import aggregate_runs, is_valid_run, load_golden, score_run
 
 EVALS_DIR = Path(__file__).parent
@@ -60,7 +60,7 @@ def main() -> None:
     # Fails before spending anything if the golden set isn't filled in.
     our_products, competitors = load_golden(json.loads(args.golden.read_text(encoding="utf-8")))
 
-    llm_client = LLMClient()
+    llm_client = LLMClient(fallback=get_fallback_endpoint())
     request = DiscoveryRequest(our_products=our_products, score_candidates=True)
     runs, raw = [], []
     for i in range(1, args.runs + 1):
