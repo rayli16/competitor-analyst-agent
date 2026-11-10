@@ -131,7 +131,10 @@ The discovery eval runs the real `/discover` against a hand-labeled list of know
 ```bash
 python -m evals.run_discovery_eval            # one run
 python -m evals.run_discovery_eval --runs 3   # run-to-run stability
+python -m evals.run_discovery_eval --cached   # replay stored search results
 ```
+
+Live search results change from day to day, so two live runs can differ for reasons unrelated to the code. `--cached` replays results stored in `evals/cache/` and searches live only for queries not yet stored, which come from company names the model extracts. Each run prints how many searches were replayed. Delete the cache file to start fresh.
 
 Each run calls the real APIs: about $0.25 in LLM cost and about 130 Tavily credits. The competitor list is internal data and is gitignored. Create `evals/golden_set.json` in the format of [`evals/golden_set.example.json`](evals/golden_set.example.json).
 
@@ -139,7 +142,7 @@ Findings from the eval so far:
 
 - When the search quota ran out, discovery returned an empty or partly unscored result with no indication of failure. This is now reported through warnings.
 - The model labeled every known trading company as a manufacturer. Trading companies in this industry commonly present themselves as factories, so the label is not used in any recommendation.
-- Recall varies between runs with no code changes, because live search results change.
+- Recall varies between runs with no code changes, because live search results change. With searches replayed by `--cached`, recall still moved from 64% to 71% between two runs, so the model's classification and merging also vary from run to run.
 
 ## Cost and latency
 
@@ -179,9 +182,9 @@ Search is billed separately by Tavily; a `/discover` run makes about 65 searches
 
 ## Roadmap
 
-- Store past runs so repeat checks report only changes.
-- Cache search results in evals so comparisons use fixed inputs.
+- Add dated recent news to `/analyze` reports, from a news search limited to recent days.
 - Merge companies that appear under both a Chinese and an English name.
+- Store past runs so repeat checks report only changes.
 
 ## Stack
 

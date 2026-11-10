@@ -6,6 +6,7 @@ the README's Langfuse numbers), so it's run by hand, never in CI.
 
     python -m evals.run_discovery_eval            # one run
     python -m evals.run_discovery_eval --runs 3   # stability across runs
+    python -m evals.run_discovery_eval --cached   # replay stored search results
 
 The real golden set (evals/golden_set.json) is internal business data and
 gitignored — create it locally in the format of evals/golden_set.example.json.
@@ -19,16 +20,21 @@ from pathlib import Path
 
 from langfuse import get_client
 
+from app import discovery
 from app.discovery import run_discovery
 from app.discovery_models import DiscoveryRequest
 from app.llm import LLMClient, get_fallback_endpoint
 from evals.metrics import aggregate_runs, is_valid_run, load_golden, score_run
+from evals.search_cache import CachedSearchClient
 
 EVALS_DIR = Path(__file__).parent
 
 
 def print_run(index: int, run: dict, seconds: float) -> None:
     print(f"\n=== run {index}  ({seconds:.0f}s) ===")
+    if "search_cache" in run:
+        c = run["search_cache"]
+        print(f"search cache      {c['hits']} replayed, {c['misses']} searched live")
     print(f"found {run['found_count']} companies, {run['deep_dive_count']} rule deep_dive")
     print(f"recall            {run['recall']:.0%}  ({len(run['matched'])}/{run['golden_total']})")
     print(f"deep_dive recall  {run['deep_dive_recall']:.0%}")
@@ -50,6 +56,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--runs", type=int, default=1, help="identical runs to execute (>1 measures stability)")
     parser.add_argument("--golden", type=Path, default=EVALS_DIR / "golden_set.json")
+    parser.add_argument(
+        "--cached",
+        nargs="?",
+        type=Path,
+        const=EVALS_DIR / "cache" / "search_cache.json",
+        metavar="PATH",
+        help="reuse stored search results and store new ones (default file: evals/cache/search_cache.json)",
+    )
     args = parser.parse_args()
 
     if not args.golden.exists():
@@ -60,6 +74,11 @@ def main() -> None:
     # Fails before spending anything if the golden set isn't filled in.
     our_products, competitors = load_golden(json.loads(args.golden.read_text(encoding="utf-8")))
 
+    cache = None
+    if args.cached:
+        cache = CachedSearchClient(discovery.tavily_client, args.cached)
+        discovery.tavily_client = cache
+
     llm_client = LLMClient(fallback=get_fallback_endpoint())
     request = DiscoveryRequest(our_products=our_products, score_candidates=True)
     runs, raw = [], []
@@ -68,12 +87,21 @@ def main() -> None:
         # Own root span per run, so eval traffic is easy to find (and filter
         # out) in Langfuse next to real requests.
         with get_client().start_as_current_observation(
-            name="eval_discovery", as_type="span", metadata={"run": i, "of": args.runs}
+            name="eval_discovery", as_type="span", metadata={"run": i, "of": args.runs, "cached": bool(cache)}
         ):
-            companies, warnings = run_discovery(llm_client, request)
+            hits_before, misses_before = (cache.hits, cache.misses) if cache else (0, 0)
+            try:
+                companies, warnings = run_discovery(llm_client, request)
+            finally:
+                if cache:
+                    # Also on Ctrl+C or a crash, so searches already paid for
+                    # are kept. Only successful searches are ever stored.
+                    cache.save()
         seconds = time.monotonic() - started
         run = score_run(competitors, companies, warnings)
         run["seconds"] = round(seconds, 1)
+        if cache:
+            run["search_cache"] = {"hits": cache.hits - hits_before, "misses": cache.misses - misses_before}
         runs.append(run)
         raw.append([c.model_dump() for c in companies])
         if not is_valid_run(run):
